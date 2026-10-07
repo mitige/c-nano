@@ -1205,7 +1205,7 @@ impl Editor {
         self.explorer = Some(Explorer::new(root));
         self.focus = Focus::Explorer;
         self.status =
-            "↑↓ naviguer · Enter ouvrir · →/← plier · Home/End extrémités · tapez pour filtrer · ^T fermer".into();
+            "↑↓ naviguer · Enter ouvrir · →/← plier · . cachés · tapez pour filtrer · ^T fermer".into();
     }
 
     /// Ouvre le fichier choisi dans l'explorateur (jamais par-dessus un
@@ -1237,13 +1237,14 @@ impl Editor {
                 self.diag_idx = None;
                 self.norme_marks.clear();
                 self.norme_note = None;
-                self.focus = Focus::Editor;
+                // on RESTE dans l'explorateur : on enchaîne les ouvertures,
+                // F2 pour aller éditer
                 let name = path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("fichier")
                     .to_string();
-                self.notify(Level::Info, format!("{name} — ouvert"));
+                self.notify(Level::Info, format!("{name} — ouvert · F2 pour éditer"));
                 self.file = Some(path);
             }
             Err(e) => self.notify(Level::Err, format!("lecture impossible : {e}")),
@@ -1312,7 +1313,15 @@ impl Editor {
                         "F2 panneaux · ^O rechercher · ^B compiler · ^S sauver".into();
                 }
             }
-            // la frappe libre filtre le projet en flou (réflexe Telescope)
+            // « . » bascule les dotfiles ; le reste filtre en flou
+            KeyCode::Char('.') => {
+                let on = ex.toggle_hidden();
+                self.status = if on {
+                    "fichiers cachés affichés (· pour masquer)".into()
+                } else {
+                    "fichiers cachés masqués".into()
+                };
+            }
             KeyCode::Char(c) => ex.push_filter(c),
             _ => {}
         }
@@ -2952,7 +2961,7 @@ other.c:1:1: error: pas notre fichier
         ed.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
         assert_eq!(ed.file.as_deref(), Some(f.as_path()));
         assert_eq!(ed.lines, vec!["int solo;"]);
-        assert_eq!(ed.focus, Focus::Editor, "le focus revient à l'éditeur");
+        assert_eq!(ed.focus, Focus::Explorer, "on reste dans l'explorateur");
         let _ = std::fs::remove_dir_all(dir);
     }
 
