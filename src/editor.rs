@@ -1,8 +1,8 @@
 //! c-nano — éditeur de code TUI, thème « Minuit » profond.
 //!
 //! Fenêtres arrondies façon lazy.nvim, explorateur de fichiers, recherche
-//! flottante, build gcc en un raccourci, norme lue dans la marge, toasts,
-//! statusline segmentée. Tab = 4 espaces, toujours. Zéro bruit visuel.
+//! flottante, terminal intégré (F3), en-tête auto (F4), opérations fichiers,
+//! toasts, statusline segmentée. Tab = 4 espaces, toujours. Zéro bruit visuel.
 
 use crate::explorer::{Explorer, FileSearch};
 use crate::highlight;
@@ -24,8 +24,15 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 
-/// Largeur du panneau explorateur (bordure comprise).
+/// Largeur du panneau explorateur (séparateur compris).
 const EXPL_W: u16 = 30;
+
+/// Style d'en-tête auto : true = Epitech (c-nano), false = informatif (rust-nano).
+const HEADER_EPITECH: bool = true;
+
+/// Hauteur du panneau terminal (bordure comprise).
+const TERM_H: u16 = 14;
+
 
 // ------------------------------------------------------------------ thème
 
@@ -140,12 +147,103 @@ fn parse_diagnostics(stderr: &str, path: &str) -> Vec<Diag> {
 
 // ------------------------------------------------------------------ focus & notifications
 
-/// Zone qui détient le focus — Alt-Tab les fait défiler.
+/// Zone qui détient le focus — F2/Alt-Tab les fait défiler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Editor,
     Explorer,
     Search,
+    Terminal,
+}
+
+/// Le terminal intégré : un vrai PTY (portable-pty) dont la sortie est
+/// interprétée par vt100 et dessinée en cellules Minuit.
+struct TermPane {
+    parser: vt100::Parser,
+    writer: Box<dyn std::io::Write + Send>,
+    rx: Receiver<Vec<u8>>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    _child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// taille PTY courante (lignes, colonnes) — pour ne redimensionner
+    /// que quand le panneau change de taille
+    size: (u16, u16),
+}
+
+impl TermPane {
+    fn spawn(cwd: &Path, rows: u16, cols: u16) -> io::Result<Self> {
+        let pty = portable_pty::native_pty_system();
+        let pair = pty
+            .openpty(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(io::Error::other)?;
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "powershell.exe".to_string()
+            } else {
+                "/bin/sh".to_string()
+            }
+        });
+        let mut cmd = portable_pty::CommandBuilder::new(shell);
+        cmd.cwd(cwd);
+        let child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
+        let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
+        let writer = pair.master.take_writer().map_err(io::Error::other)?;
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        // le slave ne sert plus : le shell tourne, le master suffit
+        drop(pair.slave);
+        Ok(Self {
+            parser: vt100::Parser::new(rows, cols, 0),
+            writer,
+            rx,
+            _master: pair.master,
+            _child: child,
+            size: (rows, cols),
+        })
+    }
+
+    /// Verse la sortie arrivée depuis le dernier rendu.
+    fn poll(&mut self) {
+        while let Ok(chunk) = self.rx.try_recv() {
+            self.parser.process(&chunk);
+        }
+    }
+
+    /// Redimensionne si le panneau a changé de taille.
+    fn resize(&mut self, rows: u16, cols: u16) {
+        if (rows, cols) == self.size || rows == 0 || cols == 0 {
+            return;
+        }
+        self.size = (rows, cols);
+        self.parser.set_size(rows, cols);
+        let _ = self._master.resize(portable_pty::PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+    }
+
+    fn send(&mut self, bytes: &[u8]) {
+        let _ = self.writer.write_all(bytes);
+        let _ = self.writer.flush();
+    }
 }
 
 /// Niveau d'une notification toast.
@@ -175,6 +273,9 @@ pub struct Editor {
     scroll_y: usize,
     file: Option<PathBuf>,
     modified: bool,
+    /// contenu tel qu'au dernier état disque — modified = (lines != saved),
+    /// donc effacer ce qu'on vient de taper re-débloque l'explorateur
+    saved: Vec<String>,
     status: String,
     clipboard: String,
     should_quit: bool,
@@ -199,12 +300,64 @@ pub struct Editor {
     focus: Focus,
     /// notifications toast empilées (haut à droite)
     toasts: Vec<Toast>,
+    /// suppression de fichier en attente de confirmation (o/n)
+    confirm_delete: Option<PathBuf>,
+    /// terminal intégré (F3), ouvert = visible
+    term: Option<TermPane>,
     /// branche git du projet (barre haute)
     git_branch: Option<String>,
     /// findings de norme détaillés (ligne, sévérité, message) — survol
     norme_details: Vec<(usize, Severity, String)>,
     /// historique pour l'undo (Ctrl+Z)
     history: Vec<(Vec<String>, usize, usize)>,
+}
+
+/// Année courante, sans dépendance (epoch → année).
+fn current_year() -> i32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (1970 + secs / 31_557_600) as i32
+}
+
+/// L'en-tête auto : format Epitech (c-nano) ou informatif `//!` (rust-nano).
+/// Description vide = squelette à compléter à la main.
+fn header_lines(project: &str, description: &str) -> Vec<String> {
+    let year = current_year();
+    let desc = if description.is_empty() {
+        "à compléter"
+    } else {
+        description
+    };
+    if HEADER_EPITECH {
+        vec![
+            "/*".into(),
+            format!("** EPITECH PROJECT, [{year}]"),
+            format!("** [{project}]"),
+            "** File description:".into(),
+            format!("** {desc}"),
+            "*/".into(),
+            String::new(),
+        ]
+    } else {
+        vec![
+            format!("//! [{project}] — [{year}]"),
+            "//! File description:".into(),
+            format!("//! {desc}"),
+            String::new(),
+        ]
+    }
+}
+
+/// Recule jusqu'à une frontière de caractère UTF-8 — le curseur ne se
+/// pose JAMAIS au milieu d'un é/à multi-octets (sinon : panique au prochain
+/// insert/remove — le crash des caractères accentués).
+fn floor_boundary(line: &str, mut i: usize) -> usize {
+    while i > 0 && !line.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 /// Dossier de travail : celui du fichier ouvert, sinon le répertoire courant.
@@ -255,6 +408,7 @@ impl Editor {
             .unwrap_or("c")
             .to_string();
         let _ = file; // l'extension est déjà extraite
+        let saved = lines.clone();
         Ok(Self {
             lines,
             cx: 0,
@@ -263,7 +417,8 @@ impl Editor {
             scroll_y: 0,
             file,
             modified: false,
-            status: "Alt+Tab panneaux · ^O rechercher · ^B compiler · ^S sauver · ^Q quitter".to_string(),
+            saved,
+            status: "F2 panneaux · ^O rechercher · ^B compiler · ^S sauver · ^Q quitter".to_string(),
             clipboard: String::new(),
             should_quit: false,
             confirm_quit: false,
@@ -280,6 +435,8 @@ impl Editor {
             search: None,
             focus: Focus::Editor,
             toasts: Vec::new(),
+            confirm_delete: None,
+            term: None,
             git_branch: detect_git_branch(file_dir(path)),
             norme_details: Vec::new(),
         })
@@ -299,6 +456,12 @@ impl Editor {
             && self.lines[0].is_empty()
     }
 
+    /// Recalcule `modified` en comparant au disque — annuler une frappe
+    /// en revenant à l'état exact sauvegardé rend le buffer propre.
+    fn sync_modified(&mut self) {
+        self.modified = self.lines != self.saved;
+    }
+
     /// Sauvegarde l'état avant une modification (pour Ctrl+Z).
     fn snapshot(&mut self) {
         self.history
@@ -313,7 +476,7 @@ impl Editor {
             self.lines = lines;
             self.cx = cx;
             self.cy = cy;
-            self.modified = true;
+            self.sync_modified();
             self.status = "annulé".into();
         }
     }
@@ -322,8 +485,8 @@ impl Editor {
         self.snapshot();
         let line = &mut self.lines[self.cy];
         line.insert(self.cx, c);
-        self.cx += 1;
-        self.modified = true;
+        self.cx += c.len_utf8(); // un é = 2 octets — on avance du caractère entier
+        self.sync_modified();
     }
 
     /// Fermante associée à une ouvrante (auto-paires).
@@ -354,7 +517,7 @@ impl Editor {
             line.insert(self.cx, close);
             line.insert(self.cx, c);
             self.cx += 1;
-            self.modified = true;
+            self.sync_modified();
             return;
         }
         self.insert_char(c);
@@ -372,7 +535,7 @@ impl Editor {
         self.cy += 1;
         self.lines.insert(self.cy, indent + &rest);
         self.cx = indent_len;
-        self.modified = true;
+        self.sync_modified();
     }
 
     fn backspace(&mut self) {
@@ -384,25 +547,32 @@ impl Editor {
                 self.cx < b.len()
                     && Self::pair_for(b[self.cx - 1] as char) == Some(b[self.cx] as char)
             };
+            // on recule à la frontière : l'accentué part en entier
+            let prev = floor_boundary(self.line(), self.cx - 1);
+            let pair = pair; // calculé avant mutation
             let line = &mut self.lines[self.cy];
-            line.remove(self.cx - 1);
+            line.drain(prev..self.cx);
+            self.cx = prev;
             if pair {
-                line.remove(self.cx - 1); // la fermante a glissé d'un cran
+                line.remove(self.cx); // la fermante (ASCII, 1 octet)
             }
-            self.cx -= 1;
-            self.modified = true;
+            self.sync_modified();
         } else if self.cy > 0 {
             let cur = self.lines.remove(self.cy);
             self.cy -= 1;
             self.cx = self.lines[self.cy].len();
             self.lines[self.cy].push_str(&cur);
-            self.modified = true;
+            self.sync_modified();
         }
     }
 
     fn move_left(&mut self) {
         if self.cx > 0 {
-            self.cx -= 1;
+            self.cx -= self.line()[..self.cx]
+                .chars()
+                .next_back()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
         } else if self.cy > 0 {
             self.cy -= 1;
             self.cx = self.lines[self.cy].len();
@@ -411,7 +581,11 @@ impl Editor {
 
     fn move_right(&mut self) {
         if self.cx < self.line().len() {
-            self.cx += 1;
+            self.cx += self.line()[self.cx..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
         } else if self.cy + 1 < self.lines.len() {
             self.cy += 1;
             self.cx = 0;
@@ -421,14 +595,16 @@ impl Editor {
     fn move_up(&mut self) {
         if self.cy > 0 {
             self.cy -= 1;
-            self.cx = self.cx.min(self.lines[self.cy].len());
+            let len = self.lines[self.cy].len();
+            self.cx = floor_boundary(&self.lines[self.cy], self.cx.min(len));
         }
     }
 
     fn move_down(&mut self) {
         if self.cy + 1 < self.lines.len() {
             self.cy += 1;
-            self.cx = self.cx.min(self.lines[self.cy].len());
+            let len = self.lines[self.cy].len();
+            self.cx = floor_boundary(&self.lines[self.cy], self.cx.min(len));
         }
     }
 
@@ -450,7 +626,7 @@ impl Editor {
                 count += n;
             }
         }
-        self.modified = count > 0;
+        if count > 0 { self.sync_modified(); }
         self.status = format!("{count} remplacement(s)");
     }
 
@@ -483,7 +659,8 @@ impl Editor {
         text.push('\n'); // C-A3 : newline final, toujours
         match std::fs::write(&path, text) {
             Ok(()) => {
-                self.modified = false;
+                self.saved = self.lines.clone();
+                self.sync_modified();
                 let name = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -611,7 +788,8 @@ impl Editor {
         self.diag_idx = Some(idx);
         let d = self.diags[idx].clone();
         self.cy = (d.line - 1).min(self.lines.len() - 1);
-        self.cx = d.col.saturating_sub(1).min(self.lines[self.cy].len());
+        let len = self.lines[self.cy].len();
+        self.cx = floor_boundary(&self.lines[self.cy], d.col.saturating_sub(1).min(len));
         let kind = if d.is_error { "✗" } else { "⚠" };
         let msg: String = d.msg.chars().take(72).collect();
         self.status = format!("{kind} {}/{n} · {}:{} · {msg}", idx + 1, d.line, d.col);
@@ -633,6 +811,16 @@ impl Editor {
         }
     }
 
+    /// Quitter : confirmation si le buffer est modifié.
+    fn request_quit(&mut self) {
+        if self.modified {
+            self.confirm_quit = true;
+            self.status = "modifié — o quitter sans sauver · s sauver+quitter · autre: rester".into();
+        } else {
+            self.should_quit = true;
+        }
+    }
+
     /// Notification toast (coin haut-droit) + le statut garde le dernier état.
     fn notify(&mut self, level: Level, text: impl Into<String>) {
         let text = text.into();
@@ -647,35 +835,272 @@ impl Editor {
         }
     }
 
+    // -------------------------------------------------------------- fichiers
+
+    /// Dossier de base pour créer un fichier : la sélection de
+    /// l'explorateur si c'est un dossier, son parent si c'est un fichier,
+    /// la racine sinon.
+    fn explorer_base_dir(&self) -> PathBuf {
+        if let Some(ex) = &self.explorer {
+            if let Some(row) = ex.rows().get(ex.sel()) {
+                if row.is_dir {
+                    return row.path.clone();
+                }
+                if let Some(parent) = row.path.parent() {
+                    return parent.to_path_buf();
+                }
+            }
+            return ex.root.clone();
+        }
+        file_dir(self.file.as_deref())
+    }
+
+    /// ^N dans l'explorateur : crée le fichier, recharge l'arbre, l'ouvre.
+    fn create_file(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let path = self.explorer_base_dir().join(name);
+        if path.exists() {
+            self.notify(Level::Warn, format!("{name} existe déjà"));
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&path, "") {
+            Ok(()) => {
+                if let Some(ex) = &mut self.explorer {
+                    ex.reload();
+                }
+                let n = path.file_name().and_then(|s| s.to_str()).unwrap_or(name).to_string();
+                // ouvre le nouveau fichier puis génère l'en-tête dessus
+                let was_modified = self.modified;
+                if !was_modified {
+                    self.open_from_explorer(path.clone());
+                    self.generate_header();
+                } else {
+                    self.notify(Level::Ok, format!("{n} — créé (buffer modifié, pas ouvert)"));
+                }
+            }
+            Err(e) => self.notify(Level::Err, format!("création impossible : {e}")),
+        }
+    }
+
+    /// ^D dans l'explorateur : supprime le fichier/dossier sélectionné
+    /// (confirmé par o/n dans la barre).
+    fn delete_selected(&mut self) {
+        let Some(ex) = &self.explorer else { return };
+        let Some(row) = ex.rows().get(ex.sel()) else { return };
+        self.confirm_delete = Some(row.path.clone());
+        self.status = format!(
+            "supprimer {} ? · o confirmer · autre : annuler",
+            row.name
+        );
+    }
+
+    fn confirm_delete_now(&mut self) {
+        let Some(path) = self.confirm_delete.take() else { return };
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => {
+                // si le fichier ouvert vient de disparaître : le buffer reste,
+                // mais il est orphelin — on le dit
+                if self.file.as_ref() == Some(&path) {
+                    self.notify(Level::Warn, format!("{name} supprimé du disque (buffer conservé)"));
+                } else {
+                    self.notify(Level::Ok, format!("{name} — supprimé"));
+                }
+                if let Some(ex) = &mut self.explorer {
+                    ex.reload();
+                }
+            }
+            Err(e) => self.notify(Level::Err, format!("suppression impossible : {e}")),
+        }
+    }
+
+    /// ^R dans l'explorateur : renomme la sélection (même dossier).
+    fn rename_selected(&mut self, new_name: &str) {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            return;
+        }
+        let Some(ex) = &self.explorer else { return };
+        let Some(row) = ex.rows().get(ex.sel()) else { return };
+        let old_path = row.path.clone();
+        let new_path = old_path.with_file_name(new_name);
+        match std::fs::rename(&old_path, &new_path) {
+            Ok(()) => {
+                // si le fichier renommé est ouvert : suivre le chemin
+                if self.file.as_ref() == Some(&old_path) {
+                    self.ext = new_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("c")
+                        .to_string();
+                    self.file = Some(new_path.clone());
+                }
+                self.notify(Level::Ok, format!("{} → {new_name}", row.name));
+                if let Some(ex) = &mut self.explorer {
+                    ex.reload();
+                }
+            }
+            Err(e) => self.notify(Level::Err, format!("renommage impossible : {e}")),
+        }
+    }
+
+    // -------------------------------------------------------------- en-tête
+
+    /// F4 : en-tête du fichier (squelette à compléter).
+    fn generate_header(&mut self) {
+        if self.file.is_none() {
+            self.status = "pas de fichier — ouvre ou crée d'abord (explorateur ^N)".into();
+            return;
+        }
+        self.insert_header(String::new());
+    }
+
+    /// Insère (ou remplace) l'en-tête en haut du fichier.
+    fn insert_header(&mut self, desc: String) {
+        let Some(path) = &self.file else { return };
+        let project = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("projet")
+            .to_string();
+        let header = header_lines(&project, &desc);
+        self.snapshot();
+        // un en-tête existant est remplacé (bloc /* … */ ou lignes //!)
+        let mut end = 0;
+        if self.lines.first().map(|l| l.trim()) == Some("/*") {
+            if let Some(i) = self.lines.iter().position(|l| l.trim() == "*/") {
+                end = i + 1;
+                if self.lines.get(end).map(|l| l.is_empty()) == Some(true) {
+                    end += 1;
+                }
+            }
+        } else {
+            while self
+                .lines
+                .get(end)
+                .map(|l| l.starts_with("//!"))
+                .unwrap_or(false)
+            {
+                end += 1;
+            }
+            if end > 0 && self.lines.get(end).map(|l| l.is_empty()) == Some(true) {
+                end += 1;
+            }
+        }
+        self.lines.splice(0..end, header);
+        self.sync_modified();
+        self.cy = 0;
+        self.cx = 0;
+        self.notify(Level::Ok, "en-tête généré ✓");
+    }
+
+    // -------------------------------------------------------------- terminal
+
+    /// F3 : ouvre/ferme le terminal intégré (panneau bas).
+    fn toggle_terminal(&mut self) {
+        if self.term.take().is_some() {
+            if self.focus == Focus::Terminal {
+                self.focus = Focus::Editor;
+            }
+            self.status = "terminal fermé".into();
+            return;
+        }
+        let cwd = file_dir(self.file.as_deref());
+        // taille approximative au spawn ; affinée au premier rendu
+        match TermPane::spawn(&cwd, TERM_H.saturating_sub(2), 80) {
+            Ok(pane) => {
+                self.term = Some(pane);
+                self.focus = Focus::Terminal;
+                self.status = "terminal — tout va au shell · Échap/F2 : retour éditeur · F3 : fermer".into();
+            }
+            Err(e) => self.notify(Level::Err, format!("terminal impossible : {e}")),
+        }
+    }
+
+    /// Touches quand le terminal a le focus : tout part au shell, sauf
+    /// Échap (retour éditeur) et F3 (fermer) — F2 reste global.
+    fn terminal_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => {
+                self.focus = Focus::Editor;
+                self.status = "F2 panneaux · ^O rechercher · ^B compiler · ^S sauver".into();
+            }
+            _ => {
+                let bytes: Vec<u8> = match (key.code, ctrl, alt) {
+                    (KeyCode::Char(c), true, _) if c.is_ascii_lowercase() => {
+                        vec![(c as u8) & 0x1f]
+                    }
+                    (KeyCode::Char(c), false, true) => {
+                        let mut v = vec![0x1b];
+                        v.extend(c.to_string().as_bytes());
+                        v
+                    }
+                    (KeyCode::Char(c), _, _) => c.to_string().into_bytes(),
+                    (KeyCode::Enter, _, _) => b"\r".to_vec(),
+                    (KeyCode::Backspace, _, _) => b"".to_vec(),
+                    (KeyCode::Tab, _, _) => b"	".to_vec(),
+                    (KeyCode::Up, _, _) => b"[A".to_vec(),
+                    (KeyCode::Down, _, _) => b"[B".to_vec(),
+                    (KeyCode::Right, _, _) => b"[C".to_vec(),
+                    (KeyCode::Left, _, _) => b"[D".to_vec(),
+                    (KeyCode::Home, _, _) => b"[H".to_vec(),
+                    (KeyCode::End, _, _) => b"[F".to_vec(),
+                    (KeyCode::Delete, _, _) => b"[3~".to_vec(),
+                    (KeyCode::PageUp, _, _) => b"[5~".to_vec(),
+                    (KeyCode::PageDown, _, _) => b"[6~".to_vec(),
+                    _ => Vec::new(),
+                };
+                if !bytes.is_empty() {
+                    if let Some(term) = &mut self.term {
+                        term.send(&bytes);
+                    }
+                }
+            }
+        }
+    }
+
     // -------------------------------------------------------------- focus
 
     /// Alt-Tab : éditeur → explorateur → recherche → éditeur.
     /// Les panneaux absents sont sautés ; sans aucun panneau, ouvre
     /// l'explorateur (le geste sert toujours).
     fn cycle_focus(&mut self) {
-        let next = match self.focus {
-            Focus::Editor => {
-                if self.explorer.is_some() {
-                    Some(Focus::Explorer)
-                } else if self.search.is_some() {
-                    Some(Focus::Search)
-                } else {
-                    self.toggle_explorer();
-                    None
-                }
-            }
-            Focus::Explorer => {
-                if self.search.is_some() {
-                    Some(Focus::Search)
-                } else {
-                    Some(Focus::Editor)
-                }
-            }
-            Focus::Search => Some(Focus::Editor),
-        };
-        if let Some(f) = next {
-            self.focus = f;
+        // ronde : éditeur → explorateur → recherche → terminal (les absents
+        // sont sautés) ; sans aucun panneau, ouvre l'explorateur
+        let mut order = vec![Focus::Editor];
+        if self.explorer.is_some() {
+            order.push(Focus::Explorer);
         }
+        if self.search.is_some() {
+            order.push(Focus::Search);
+        }
+        if self.term.is_some() {
+            order.push(Focus::Terminal);
+        }
+        if order.len() == 1 {
+            self.toggle_explorer();
+            return;
+        }
+        let pos = order.iter().position(|f| *f == self.focus).unwrap_or(0);
+        self.focus = order[(pos + 1) % order.len()];
     }
 
     // -------------------------------------------------------------- recherche
@@ -737,16 +1162,6 @@ impl Editor {
 
     // -------------------------------------------------------------- explorateur
 
-    /// Quitter : confirmation si le buffer est modifié.
-    fn request_quit(&mut self) {
-        if self.modified {
-            self.confirm_quit = true;
-            self.status = "modifié — o quitter sans sauver · s sauver+quitter · autre: rester".into();
-        } else {
-            self.should_quit = true;
-        }
-    }
-
     /// ^T : ouvre/ferme le panneau de fichiers (racine : dossier du fichier,
     /// sinon le répertoire courant).
     fn toggle_explorer(&mut self) {
@@ -783,6 +1198,7 @@ impl Editor {
                 if lines.is_empty() {
                     lines.push(String::new());
                 }
+                self.saved = lines.clone();
                 self.lines = lines;
                 self.ext = path
                     .extension()
@@ -815,12 +1231,39 @@ impl Editor {
     /// ^B, ^T) passent partout, le reste pilote l'arbre et le filtre.
     fn explorer_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // confirmation de suppression en cours : o/y efface, le reste annule
+        if self.confirm_delete.is_some() {
+            match key.code {
+                KeyCode::Char('o') | KeyCode::Char('y') => self.confirm_delete_now(),
+                _ => {
+                    self.confirm_delete = None;
+                    self.status = "suppression annulée".into();
+                }
+            }
+            return;
+        }
         if ctrl {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Char('x') => self.request_quit(),
                 KeyCode::Char('s') => self.save(),
                 KeyCode::Char('b') => self.build(),
                 KeyCode::Char('t') => self.toggle_explorer(),
+                // opérations fichiers — le ^N/^P des diagnostics reste à l'éditeur
+                KeyCode::Char('n') => {
+                    self.prompt = Some(('n', String::new()));
+                    self.status = "nouveau fichier :".into();
+                }
+                KeyCode::Char('d') => self.delete_selected(),
+                KeyCode::Char('r') => {
+                    let cur = self
+                        .explorer
+                        .as_ref()
+                        .and_then(|ex| ex.rows().get(ex.sel()))
+                        .map(|r| r.name.clone())
+                        .unwrap_or_default();
+                    self.prompt = Some(('w', cur));
+                    self.status = "renommer en :".into();
+                }
                 _ => {}
             }
             return;
@@ -843,7 +1286,7 @@ impl Editor {
                 if !ex.clear_filter() {
                     self.focus = Focus::Editor;
                     self.status =
-                        "Alt+Tab panneaux · ^O rechercher · ^B compiler · ^S sauver".into();
+                        "F2 panneaux · ^O rechercher · ^B compiler · ^S sauver".into();
                 }
             }
             // la frappe libre filtre le projet en flou (réflexe Telescope)
@@ -880,6 +1323,10 @@ impl Editor {
                         self.find(&text);
                     } else if kind == 'r' {
                         self.replace_all(&text);
+                    } else if kind == 'n' {
+                        self.create_file(&text);
+                    } else if kind == 'w' {
+                        self.rename_selected(&text);
                     } else if kind == 'g' {
                         if let Ok(n) = text.trim().parse::<usize>() {
                             if n >= 1 && n <= self.lines.len() {
@@ -921,6 +1368,15 @@ impl Editor {
             self.toggle_search();
             return;
         }
+        if key.code == KeyCode::F(3) {
+            self.toggle_terminal();
+            return;
+        }
+        // focus terminal : tout va au shell
+        if self.focus == Focus::Terminal && self.term.is_some() {
+            self.terminal_key(key);
+            return;
+        }
         // focus recherche / explorateur : touches dédiées (les globales passent)
         if self.focus == Focus::Search && self.search.is_some() {
             self.search_key(key);
@@ -938,6 +1394,8 @@ impl Editor {
             }
             (KeyCode::Char('t'), true, _) => self.toggle_explorer(),
             (KeyCode::Char('s'), true, _) => self.save(),
+            (KeyCode::F(4), _, _) => self.generate_header(),
+            (KeyCode::F(3), _, _) => self.toggle_terminal(),
             (KeyCode::Char('b'), true, _) => self.build(),
             (KeyCode::Char('n'), true, _) => self.diag_jump(1),
             (KeyCode::Char('p'), true, _) => self.diag_jump(-1),
@@ -963,7 +1421,7 @@ impl Editor {
                 }
                 self.cy = self.cy.min(self.lines.len() - 1);
                 self.cx = self.cx.min(self.line().len());
-                self.modified = true;
+                self.sync_modified();
                 self.status = "ligne coupée".into();
             }
             (KeyCode::Char('u'), true, _) => {
@@ -971,7 +1429,7 @@ impl Editor {
                     self.snapshot();
                     let clip = self.clipboard.clone();
                     self.lines.insert(self.cy, clip);
-                    self.modified = true;
+                    self.sync_modified();
                     self.status = "ligne collée".into();
                 }
             }
@@ -985,8 +1443,14 @@ impl Editor {
             (KeyCode::Backspace, _, _) => self.backspace(),
             (KeyCode::Delete, _, _) => {
                 if self.cx < self.line().len() {
-                    self.lines[self.cy].remove(self.cx);
-                    self.modified = true;
+                    let next = self.cx
+                        + self.line()[self.cx..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(1);
+                    self.lines[self.cy].drain(self.cx..next);
+                    self.sync_modified();
                 }
             }
             (KeyCode::Enter, _, _) => self.insert_newline(),
@@ -1185,7 +1649,7 @@ fn draw_box(
 /// d'accueil de lazy.nvim, transposé aux gestes de c-nano. Aucune tagline.
 fn draw_welcome_float(frame: &mut Frame, area: ratatui::layout::Rect) {
     let w = area.width.saturating_sub(4).min(46);
-    let h = area.height.saturating_sub(2).min(23);
+    let h = area.height.saturating_sub(2).min(24);
     if w < 20 || h < 10 {
         return;
     }
@@ -1232,6 +1696,7 @@ fn draw_welcome_float(frame: &mut Frame, area: ratatui::layout::Rect) {
         Line::from(""),
         section("Code"),
         entry("^B", "compiler"),
+        entry("F4", "en-tête auto"),
         entry("^F", "chercher"),
         entry("^R", "remplacer"),
         entry("^G", "aller à la ligne"),
@@ -1310,12 +1775,32 @@ fn draw(frame: &mut Frame, ed: &mut Editor) {
         }
         None => title.push((" c-nano ".into(), Ed::dim())),
     }
-    let inner = draw_box(frame, edit_zone, &title, border_for(ed.focus != Focus::Explorer));
+    // le terminal prend le bas de la colonne éditeur quand il est ouvert
+    let (editor_area, term_area) = if ed.term.is_some() {
+        let sp = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(TERM_H)])
+            .split(edit_zone);
+        (sp[0], Some(sp[1]))
+    } else {
+        (edit_zone, None)
+    };
+    let inner = draw_box(
+        frame,
+        editor_area,
+        &title,
+        border_for(matches!(ed.focus, Focus::Editor | Focus::Search)),
+    );
+    if let Some(ta) = term_area {
+        if let Some(term) = &mut ed.term {
+            draw_terminal(frame, term, ta, ed.focus == Focus::Terminal);
+        }
+    }
     if ed.is_welcome() {
         draw_welcome_float(frame, inner);
     } else {
         draw_body(frame, ed, inner);
-        draw_diagnostics(frame, ed, edit_zone);
+        draw_diagnostics(frame, ed, editor_area);
     }
     // floats par-dessus tout : recherche, puis toasts
     if let Some(fs) = &mut ed.search {
@@ -1377,6 +1862,7 @@ fn draw_statusbar(frame: &mut Frame, ed: &Editor, area: ratatui::layout::Rect) {
         Focus::Editor => (" ÉDITEUR ", Ed::cyan()),
         Focus::Explorer => (" EXPLORER ", Ed::green()),
         Focus::Search => (" RECHERCHE ", Color::Rgb(0xC6, 0xA0, 0xF6)),
+        Focus::Terminal => (" TERMINAL ", Ed::amber()),
     };
     x = put_seg(buf, x, area.y, label, Ed::bg(), color, true) + 1;
     // segment fichier
@@ -1418,6 +1904,8 @@ fn draw_statusbar(frame: &mut Frame, ed: &Editor, area: ratatui::layout::Rect) {
         let label = match k {
             'f' => "chercher : ",
             'r' => "remplacer : ",
+            'n' => "nouveau fichier : ",
+            'w' => "renommer en : ",
             _ => "ligne : ",
         };
         format!("{label}{t}▌")
@@ -1486,6 +1974,8 @@ fn draw_search(frame: &mut Frame, fs: &mut FileSearch, zone: ratatui::layout::Re
                 let rel = fs.rel(path);
                 let selected = start + i == sel;
                 let mut spans = vec![Span::raw(if selected { "▎" } else { " " })];
+                let icon_color = file_color(rel.rsplit('/').next().unwrap_or(&rel), false);
+                spans.push(Span::styled("◆ ", Style::default().fg(icon_color)));
                 match rel.rsplit_once('/') {
                     Some((dir, name)) => {
                         spans.push(Span::styled(format!("{dir}/"), Style::default().fg(Ed::gutter())));
@@ -1521,15 +2011,38 @@ fn draw_toasts(frame: &mut Frame, ed: &mut Editor, area: ratatui::layout::Rect) 
     ed.toasts
         .retain(|t| t.at.elapsed() < Duration::from_millis(3500));
     let shown: Vec<&Toast> = ed.toasts.iter().rev().take(3).collect();
-    for (i, toast) in shown.into_iter().enumerate() {
-        let text_w = UnicodeWidthStr::width(toast.text.as_str());
-        let w = ((text_w + 6).clamp(14, 46)) as u16;
+    let mut y = area.y + 1;
+    for toast in shown {
+        // le texte se wrappe sur 2 lignes — plus jamais tronqué
+        let inner_w = 42usize; // colonnes de texte max par ligne
+        let words: Vec<&str> = toast.text.split_whitespace().collect();
+        let mut lines_t: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for w in words {
+            let cand = if cur.is_empty() { w.to_string() } else { format!("{cur} {w}") };
+            if UnicodeWidthStr::width(cand.as_str()) > inner_w && !cur.is_empty() {
+                lines_t.push(cur);
+                cur = w.to_string();
+            } else {
+                cur = cand;
+            }
+        }
+        if !cur.is_empty() {
+            lines_t.push(cur);
+        }
+        lines_t.truncate(2);
+        let text_w = lines_t
+            .iter()
+            .map(|l| UnicodeWidthStr::width(l.as_str()))
+            .max()
+            .unwrap_or(4);
+        let w = ((text_w + 6).clamp(14, 48)) as u16;
+        let h = lines_t.len() as u16 + 2;
         let x = area.right().saturating_sub(w + 1);
-        let y = area.y + 1 + i as u16 * 4;
-        if y + 3 >= area.bottom() {
+        if y + h + 1 >= area.bottom() {
             break;
         }
-        let rect = ratatui::layout::Rect { x, y, width: w, height: 3 };
+        let rect = ratatui::layout::Rect { x, y, width: w, height: h };
         fill(frame, rect, Style::default().bg(float_bg()));
         let (icon, color) = match toast.level {
             Level::Ok => ("✓", Ed::green()),
@@ -1538,14 +2051,17 @@ fn draw_toasts(frame: &mut Frame, ed: &mut Editor, area: ratatui::layout::Rect) 
             Level::Info => ("ℹ", Ed::cyan()),
         };
         let inner = draw_box(frame, rect, &[], color);
-        let text: String = toast.text.chars().take((w as usize).saturating_sub(5)).collect();
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("{icon} "), Style::default().fg(color)),
-                Span::styled(text, Style::default().fg(Ed::text())),
-            ])),
-            inner,
-        );
+        let lines: Vec<Line> = lines_t
+            .iter()
+            .map(|l| {
+                Line::from(vec![
+                    Span::styled(format!("{icon} "), Style::default().fg(color)),
+                    Span::styled(l.clone(), Style::default().fg(Ed::text())),
+                ])
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
+        y += h + 1;
     }
 }
 
@@ -1705,7 +2221,11 @@ fn draw_explorer(frame: &mut Frame, ex: &mut Explorer, area: ratatui::layout::Re
                     let arrow = if row.expanded { "▾ " } else { "▸ " };
                     spans.push(Span::styled(arrow, Style::default().fg(Ed::cyan())));
                 } else {
-                    spans.push(Span::raw("  "));
+                    // icône du langage : ◆ teinté par type de fichier
+                    spans.push(Span::styled(
+                        "◆ ",
+                        Style::default().fg(file_color(&row.name, false)),
+                    ));
                 }
                 let mut name_style = Style::default().fg(file_color(&row.name, row.is_dir));
                 if selected {
@@ -1726,6 +2246,64 @@ fn draw_explorer(frame: &mut Frame, ex: &mut Explorer, area: ratatui::layout::Re
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), rows_area);
+}
+
+/// Conversion couleur vt100 → ratatui (défaut = la palette Minuit).
+fn vt_color(c: vt100::Color, default: Color) -> Color {
+    match c {
+        vt100::Color::Default => default,
+        vt100::Color::Idx(i) => Color::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// Le panneau terminal : boîte arrondie, cellules vt100 rendues en Minuit.
+fn draw_terminal(frame: &mut Frame, term: &mut TermPane, area: ratatui::layout::Rect, focused: bool) {
+    let inner = draw_box(
+        frame,
+        area,
+        &[(" terminal ".into(), Ed::dim())],
+        border_for(focused),
+    );
+    term.resize(inner.height, inner.width);
+    let screen = term.parser.screen();
+    let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
+    for row in 0..inner.height {
+        let mut spans: Vec<Span> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_style: Option<Style> = None;
+        for col in 0..inner.width {
+            let Some(cell) = screen.cell(row, col) else { break };
+            let fg = vt_color(cell.fgcolor(), Ed::text());
+            let bg = vt_color(cell.bgcolor(), Ed::bg());
+            let mut st = Style::default().fg(fg).bg(bg);
+            if cell.bold() {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            let text = cell.contents();
+            let text = if text.is_empty() { " ".to_string() } else { text };
+            if cur_style == Some(st) {
+                cur.push_str(&text);
+            } else {
+                if !cur.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut cur), cur_style.unwrap()));
+                }
+                cur_style = Some(st);
+                cur.push_str(&text);
+            }
+        }
+        if !cur.is_empty() {
+            spans.push(Span::styled(cur, cur_style.unwrap_or_default()));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+    if focused {
+        let (cr, cc) = screen.cursor_position();
+        if cr < inner.height && cc < inner.width {
+            frame.set_cursor_position((inner.x + cc, inner.y + cr));
+        }
+    }
 }
 
 /// Corps de l'éditeur : gouttière à marqueurs + texte coloré.
@@ -1845,6 +2423,9 @@ fn loop_run(
     while !ed.should_quit {
         ed.poll_norme();
         ed.poll_diag();
+        if let Some(term) = &mut ed.term {
+            term.poll();
+        }
         let size = terminal.size()?;
         let text_w = if ed.explorer.is_some() {
             size.width.saturating_sub(EXPL_W)
@@ -1973,7 +2554,155 @@ mod pair_tests {
         ed.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
         assert_eq!(ed.lines[0], "a");
     }
+
+    /// Taper puis effacer jusqu'à l'état disque → le buffer redevient
+    /// propre : plus de fausse alerte « modifié », l'explorateur s'ouvre.
+    #[test]
+    fn retour_a_l_etat_disque_rend_propre() {
+        let mut ed = Editor::open(None).unwrap();
+        ed.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert!(ed.modified);
+        ed.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+        assert!(!ed.modified, "revenu à l'état disque = propre");
+        // l'explorateur ne bloque donc plus
+        ed.explorer = Some(Explorer::new(std::env::temp_dir()));
+        ed.focus = Focus::Explorer;
+        ed.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        // aucune plainte « buffer modifié »
+        assert!(!ed.status.contains("^S pour sauvegarder"), "{}", ed.status);
+    }
+
+    /// F3 ouvre le terminal (focus dedans), Échap en sort sans fermer,
+    /// F3 referme. Le cycle F2 l'inclut quand il est ouvert.
+    #[test]
+    fn terminal_toggle_et_cycle() {
+        let mut ed = Editor::open(None).unwrap();
+        assert!(ed.term.is_none());
+        ed.on_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::empty()));
+        assert!(ed.term.is_some(), "le PTY est spawné");
+        assert_eq!(ed.focus, Focus::Terminal);
+        ed.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(ed.focus, Focus::Editor);
+        assert!(ed.term.is_some(), "Échap ne ferme pas, juste le focus");
+        // sans explorateur ouvert, la ronde est éditeur ↔ terminal
+        ed.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()));
+        assert_eq!(ed.focus, Focus::Terminal, "ronde : éditeur → terminal");
+        ed.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()));
+        assert_eq!(ed.focus, Focus::Editor, "…et retour");
+        ed.on_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::empty()));
+        assert!(ed.term.is_none());
+    }
+
+    /// Explorateur : ^N crée (et ouvre + en-tête), ^R renomme, ^D supprime
+    /// après confirmation o.
+    #[test]
+    fn ops_fichiers_creer_renommer_supprimer() {
+        let dir = std::env::temp_dir().join(format!("cnano-ops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut ed = Editor::open(None).unwrap();
+        ed.explorer = Some(Explorer::new(dir.clone()));
+        ed.focus = Focus::Explorer;
+
+        // ^N nouveau fichier
+        ed.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        for c in "neuf.c".chars() {
+            ed.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        ed.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        let created = dir.join("neuf.c");
+        assert!(created.exists(), "créé sur le disque");
+        assert_eq!(ed.file.as_deref(), Some(created.as_path()), "ouvert");
+        // en-tête squelette inséré (pas de modèle en test)
+        assert!(ed.lines[0].starts_with("/*"), "en-tête Epitech: {}", ed.lines[0]);
+        assert!(ed.lines.iter().any(|l| l.contains("EPITECH PROJECT, [")),);
+
+        // ^R renomme (le fichier est sélectionné dans l'arbre rechargé)
+        let pos = ed.explorer.as_ref().unwrap().rows().iter()
+            .position(|r| r.name == "neuf.c").unwrap();
+        // sélectionne-le en naviguant
+        while ed.explorer.as_ref().unwrap().sel() > pos {
+            ed.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        }
+        while ed.explorer.as_ref().unwrap().sel() < pos {
+            ed.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        }
+        // buffer modifié (en-tête inséré) → sauve d'abord pour suivre le rename
+        ed.save();
+        // l'ouverture a rendu le focus à l'éditeur : retour explorateur
+        ed.focus = Focus::Explorer;
+        ed.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        // le prompt est pré-rempli du nom courant — on l'efface et on tape
+        for _ in 0..8 { ed.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty())); }
+        for c in "dix.c".chars() {
+            ed.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        ed.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(dir.join("dix.c").exists());
+        assert!(!created.exists(), "l'ancien nom a disparu");
+        assert!(ed.file.as_deref().unwrap().ends_with("dix.c"), "l'éditeur suit");
+
+        // ^D puis 'o' supprime
+        ed.focus = Focus::Explorer;
+        ed.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(ed.confirm_delete.is_some());
+        ed.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
+        assert!(!dir.join("dix.c").exists(), "supprimé du disque");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// L'en-tête Epitech respecte le format exact des travaux (crochets).
+    #[test]
+    fn entete_epitech_format_exact() {
+        let h = header_lines("my_swap", "échange deux valeurs");
+        assert_eq!(h[0], "/*");
+        assert!(h[1].starts_with("** EPITECH PROJECT, ["), "{}", h[1]);
+        assert_eq!(h[2], "** [my_swap]");
+        assert_eq!(h[3], "** File description:");
+        assert_eq!(h[4], "** échange deux valeurs");
+        assert_eq!(h[5], "*/");
+    }
+
+    /// É, à, ü… multi-octets : rafale de mouvements rapides + suppressions.
+    /// Le bug d'origine : cx atterrissait au milieu d'un caractère → panique.
+    #[test]
+    fn accentues_ne_crachent_plus_jamais() {
+        let mut ed = Editor::open(None).unwrap();
+        for c in "héllö àü ù".chars() {
+            ed.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        assert_eq!(ed.lines[0], "héllö àü ù");
+        // rafale gauche/droite aussi vite que possible
+        for _ in 0..50 {
+            ed.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()));
+            ed.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()));
+            ed.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()));
+        }
+        // backspace traverse un é (2 octets) sans panique et le retire entier
+        ed.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::empty()));
+        for _ in 0..3 {
+            ed.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+        }
+        assert_eq!(ed.lines[0], "héllö à");
+        // Delete au début retire 'h', puis encore, sans jamais paniquer
+        ed.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty()));
+        ed.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()));
+        assert_eq!(ed.lines[0], "éllö à");
+        // lignes de largeurs différentes : la colonne retombe sur une frontière
+        ed.lines = vec!["éééé".into(), "ab".into()];
+        ed.cy = 0;
+        ed.cx = 8; // fin de "éééé" (4 × 2 octets)
+        ed.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(ed.cx, 2, "clampé ET sur frontière");
+        ed.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        // insertion après un accentué : jamais au milieu
+        ed.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()));
+        ed.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert_eq!(ed.lines[0], "ééxéé");
+    }
 }
+
 
 #[cfg(test)]
 mod diag_tests {
@@ -2173,9 +2902,11 @@ other.c:1:1: error: pas notre fichier
         ed.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT));
         assert_eq!(ed.focus, Focus::Explorer);
         assert!(ed.explorer.is_some());
-        // encore : retour éditeur — Ctrl+Tab marche pareil
+        // encore : retour éditeur — Ctrl+Tab et F2 marchent pareil
         ed.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
         assert_eq!(ed.focus, Focus::Editor);
+        ed.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()));
+        assert_eq!(ed.focus, Focus::Explorer, "F2 cycle aussi");
         // avec la recherche ouverte, elle est dans le cycle
         ed.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert_eq!(ed.focus, Focus::Search);

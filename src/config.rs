@@ -122,13 +122,14 @@ pub fn ensure_exists() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-pub const DEFAULT_CONFIG: &str = r##"# Configuration c-nano
+pub const DEFAULT_CONFIG: &str = r##"# Configuration c-man
 
-# Identité (facultatif) :
+# Identité pour l'en-tête Epitech généré par `c-man fix --header` :
 # name = "Prénom Nom"
-# login = "prenom.nom"
+# login = "prenom.nom"          # login Epitech (pour <login@epitech.eu>)
 
-# Règles de la Norme Epitech (valeurs = défauts) :
+
+# Règles de la Norme (valeurs = défauts piscine) :
 # max_columns = 80
 # max_function_lines = 25
 # max_functions_per_file = 5
