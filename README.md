@@ -32,3 +32,6 @@ le thème et les syntaxes sont embarqués. Optionnels mais recommandés :
 
 Auto-paires, règle colonne 80, vérification de norme à la sauvegarde,
 notifications toast, statusline segmentée. Zéro configuration.
+
+Les icônes de fichiers utilisent les devicons d'une Nerd Font (JetBrainsMono
+Nerd Font recommandée) ; sans elle,  revient aux lettres cerclées.
